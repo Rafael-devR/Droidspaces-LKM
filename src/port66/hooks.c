@@ -238,16 +238,21 @@ static int write_hook(struct ds_hook *hook, bool restore)
 	return 0;
 }
 
+/* Deferred printk: safe while CPUs are stopped; only traces progress. */
+#define DS_TRACE(fmt, ...) printk_deferred(KERN_INFO pr_fmt(fmt), ##__VA_ARGS__)
+
 static int install_stopped(void *unused)
 {
 	unsigned int i;
 	int ret;
+	DS_TRACE("install_stopped: CPUs stopped, starting\n");
 	for (i = 0; i < ARRAY_SIZE(hooks); i++) {
 		struct ds_hook *h = &hooks[i];
 		u32 code[8];
 		unsigned int j;
 		if (!h->original)
 			continue;
+		DS_TRACE("trampoline %s: writing\n", h->name);
 		memcpy(code, h->saved, sizeof(h->saved));
 		code[4] = 0x58000050;
 		code[5] = 0xd61f0200;
@@ -258,21 +263,31 @@ static int install_stopped(void *unused)
 			if (ret)
 				goto rollback;
 		}
+		DS_TRACE("trampoline %s: ok\n", h->name);
 	}
 
 	for (i = 0; i < ARRAY_SIZE(hooks); i++) {
+		DS_TRACE("patching %s\n", hooks[i].name);
 		ret = write_hook(&hooks[i], false);
 		if (ret)
 			goto rollback;
+		DS_TRACE("patched %s ok\n", hooks[i].name);
 	}
 	for (i = 0; i < ARRAY_SIZE(proc_hooks); i++) {
+		DS_TRACE("patching %s\n", proc_hooks[i].name);
 		ret = write_hook(&proc_hooks[i], false);
 		if (ret)
 			goto rollback;
+		DS_TRACE("patched %s ok\n", proc_hooks[i].name);
 	}
+	DS_TRACE("setting init_pid_ns.ns.ops\n");
 	WRITE_ONCE(init_pid_ns.ns.ops, &pidns_operations);
+	DS_TRACE("init_pid_ns.ns.ops set\n");
 	for (i = 0; i < ARRAY_SIZE(ipc_syscalls); i++) {
+		DS_TRACE("patching syscall %s\n", ipc_syscalls[i].name);
 		ret = write_syscall(&ipc_syscalls[i], false);
+		if (!ret)
+			DS_TRACE("patched syscall %s ok\n", ipc_syscalls[i].name);
 		if (ret) {
 			WRITE_ONCE(init_pid_ns.ns.ops, NULL);
 			goto rollback;
@@ -280,7 +295,10 @@ static int install_stopped(void *unused)
 	}
 	WRITE_ONCE(ds_ipc_active, true);
 	for (i = 0; i < ARRAY_SIZE(bpf_hooks); i++) {
+		DS_TRACE("patching bpf pointer %u\n", i);
 		ret = write_pointer(bpf_hooks[i].slot, bpf_hooks[i].replacement);
+		if (!ret)
+			DS_TRACE("patched bpf pointer %u ok\n", i);
 		if (ret) {
 			WRITE_ONCE(ds_ipc_active, false);
 			WRITE_ONCE(init_pid_ns.ns.ops, NULL);
@@ -356,6 +374,51 @@ int ds_hooks_prepare(void)
 	return 0;
 }
 
+/* Writes every site with the value it already holds, through the same
+ * patching primitive the real install uses. No behavior changes; a failure
+ * (or a fault) here means the real install would fail at that site too.
+ */
+int ds_hooks_probe(void)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(hooks) + ARRAY_SIZE(proc_hooks); i++) {
+		struct ds_hook *h = i < ARRAY_SIZE(hooks) ? &hooks[i] :
+				    &proc_hooks[i - ARRAY_SIZE(hooks)];
+		pr_info("probe: text %s\n", h->name);
+		ret = aarch64_insn_patch_text_nosync((void *)h->address, h->saved[0]);
+		if (ret) {
+			pr_err("probe: text %s failed: %d\n", h->name, ret);
+			return ret;
+		}
+	}
+	for (i = 0; i < ARRAY_SIZE(ipc_syscalls); i++) {
+		struct ds_syscall_hook *h = &ipc_syscalls[i];
+		u32 *slot = (u32 *)&syscall_table[h->nr];
+		pr_info("probe: syscall %s\n", h->name);
+		ret = aarch64_insn_patch_text_nosync(slot, lower_32_bits(h->saved));
+		if (!ret)
+			ret = aarch64_insn_patch_text_nosync(slot + 1, upper_32_bits(h->saved));
+		if (ret) {
+			pr_err("probe: syscall %s failed: %d\n", h->name, ret);
+			return ret;
+		}
+	}
+	for (i = 0; i < ARRAY_SIZE(bpf_hooks); i++) {
+		pr_info("probe: bpf pointer %u\n", i);
+		ret = write_pointer(bpf_hooks[i].slot, bpf_hooks[i].saved);
+		if (ret) {
+			pr_err("probe: bpf pointer %u failed: %d\n", i, ret);
+			return ret;
+		}
+	}
+	pr_info("probe: all %zu text, %zu syscall, %zu bpf sites writable\n",
+		ARRAY_SIZE(hooks) + ARRAY_SIZE(proc_hooks), ARRAY_SIZE(ipc_syscalls),
+		ARRAY_SIZE(bpf_hooks));
+	return 0;
+}
+
 int ds_hooks_install(void)
 {
 	int ret = ds_hooks_prepare();
@@ -364,6 +427,7 @@ int ds_hooks_install(void)
 		return ret;
 	/* Objects in procfs can retain operation pointers after all tasks exit. */
 	__module_get(THIS_MODULE);
+	pr_info("entering stop_machine; installing hooks\n");
 	ret = stop_machine(install_stopped, NULL, NULL);
 	if (ret)
 		module_put(THIS_MODULE);

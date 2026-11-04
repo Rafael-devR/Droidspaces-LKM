@@ -15,6 +15,10 @@ static bool plc110_test;
 module_param(plc110_test, bool, 0400);
 MODULE_PARM_DESC(plc110_test, "Opt in to PLC110 testing on the exact recorded 6.6.118 kernel");
 
+static bool patch_probe;
+module_param(patch_probe, bool, 0400);
+MODULE_PARM_DESC(patch_probe, "Rewrite each patch site with its own current value to test writability; changes no behavior");
+
 static bool activate;
 module_param(activate, bool, 0400);
 MODULE_PARM_DESC(activate, "Install experimental hooks on a recorded 6.6 kernel");
@@ -95,6 +99,15 @@ static int __init ds_port_init(void)
 		ds_ipc_flush();
 		ds_pid_exit();
 		return ret;
+	}
+	if (patch_probe) {
+		ret = ds_hooks_probe();
+		if (ret) {
+			ds_ipc_backend_exit();
+			ds_ipc_flush();
+			ds_pid_exit();
+			return ret;
+		}
 	}
 	if (activate) {
 		ret = ds_hooks_install();
