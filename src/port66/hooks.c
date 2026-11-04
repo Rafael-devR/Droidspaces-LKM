@@ -173,6 +173,7 @@ static bool movable_prologue(u32 op)
 {
 	/* NOP/PACIASP; stack allocation/frame pointer; stack stores, no PC operands. */
 	return op == 0xd503201f || op == 0xd503233f ||
+		op == 0xf800865e || /* SCS: str x30,[x18],#8 */
 		(op & 0xffc003ff) == 0xd10003ff ||
 		(op & 0xffc003ff) == 0x910003fd ||
 		(op & 0xffc003e0) == 0xf90003e0 || /* STR xN,[sp,#imm] */
@@ -208,8 +209,9 @@ static int prepare_hook(struct ds_hook *hook)
 		unsigned int i;
 		for (i = 0; i < ARRAY_SIZE(hook->saved); i++) {
 			if (!movable_prologue(hook->saved[i])) {
-				pr_err("unsupported original prologue %s word %u: %08x\n",
-				       hook->name, i, hook->saved[i]);
+				pr_err("unsupported original prologue %s word %u: %08x (words: %08x %08x %08x %08x)\n",
+				       hook->name, i, hook->saved[i], hook->saved[0],
+				       hook->saved[1], hook->saved[2], hook->saved[3]);
 				return -EOPNOTSUPP;
 			}
 		}
