@@ -1,0 +1,109 @@
+name: GKI pipeline
+on:
+  push:
+    branches: [ci-pipeline]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: '6.18', kmi: android17-6.18}
+          - {target: '6.12', kmi: android16-6.12}
+          - {target: '6.6',  kmi: android15-6.6}
+          - {target: '6.1',  kmi: android14-6.1}
+          - {target: '5.15', kmi: android13-5.15}
+          - {target: '5.10', kmi: android12-5.10}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - name: Build module
+        run: python3 scripts/build-gki.py ${{ matrix.target }} -j4
+      - name: Prepare ABI inputs
+        run: |
+          sudo python3 scripts/prepare-gki-vm.py ${{ matrix.target }}
+          sudo chown -R "$(id -u):$(id -g)" out
+      - run: tar -C out/gki -cf build-${{ matrix.kmi }}.tar ${{ matrix.kmi }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.kmi }}
+          path: build-${{ matrix.kmi }}.tar
+          retention-days: 3
+
+  vm:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: '6.18', kmi: android17-6.18}
+          - {target: '6.12', kmi: android16-6.12}
+          - {target: '6.6',  kmi: android15-6.6}
+          - {target: '6.1',  kmi: android14-6.1}
+          - {target: '5.15', kmi: android13-5.15}
+          - {target: '5.10', kmi: android12-5.10}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-${{ matrix.kmi }}
+      - run: |
+          mkdir -p out/gki
+          tar -C out/gki -xf build-${{ matrix.kmi }}.tar
+      - name: Build test image and ABI checker
+        run: |
+          docker build --platform linux/arm64 -t droidspaces-lkm-vm:local tests/vm
+          python3 scripts/build-abi-check.py
+      - name: QEMU regression
+        run: python3 tests/vm/run-gki.py ${{ matrix.target }}
+      - run: |
+          sudo chown -R "$(id -u):$(id -g)" out
+          tar -C out/gki -cf vm-${{ matrix.kmi }}.tar ${{ matrix.kmi }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vm-${{ matrix.kmi }}
+          path: vm-${{ matrix.kmi }}.tar
+          retention-days: 3
+      - uses: actions/upload-artifact@v4
+        if: matrix.target == '6.6'
+        with:
+          name: abi-bin
+          path: out/gki/bin
+          retention-days: 3
+
+  package:
+    needs: vm
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vm-*
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: abi-bin
+          path: out/gki/bin
+      - run: |
+          mkdir -p out/gki
+          for t in vm-*.tar; do tar -C out/gki -xf "$t"; done
+          chmod +x out/gki/bin/abi-check
+      - run: |
+          python3 tests/module/test_loader.py
+          python3 tests/abi/test_check.py
+          python3 scripts/package-module.py --output out/release
+          cp out/gki/android15-6.6/droidspaces_ns.ko out/release/droidspaces_ns-android15-6.6-gki.ko
+          (cd out/release && sha256sum * | tee SHA256SUMS.txt)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: out/release
+          retention-days: 7
