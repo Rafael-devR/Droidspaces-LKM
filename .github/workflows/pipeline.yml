@@ -24,6 +24,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Free disk space
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - name: Pre-create output dir writable by the container and host
+        run: mkdir -p out/gki/${{ matrix.kmi }} && chmod -R a+rwX out
       - name: Build module
         run: python3 scripts/build-gki.py ${{ matrix.target }} -j4
       - name: Prepare ABI inputs
